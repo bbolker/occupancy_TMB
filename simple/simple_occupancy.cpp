@@ -8,42 +8,42 @@ Type objective_function<Type>::operator() () {
   PARAMETER_VECTOR(beta_psi);
   
   // data
-  DATA_IVECTOR(obs);      // observations
+  DATA_VECTOR(obs);      // observations (not integer??)
   DATA_IVECTOR(site);     // sites corresponding to obs
   DATA_IVECTOR(site_tot); // total obs per site (FIXME: compute this up-front in TMB?)
-  DATA_MATRIX(Xpsi);      // occupancy model matrix
-  DATA_MATRIX(Xp);        // detection model matrix
+  DATA_MATRIX(Xpsi);      // occupancy model matrix (Ns x length(beta_psi))
+  DATA_MATRIX(Xp);        // detection model matrix (N  x length(beta_p
+
   
-  int ns = Xpsi.rows();   // nb of sites
   int N = obs.size();     // total obs
-  int npar = b.size();
-  int npar_p = Xpsi.rows(); // nb of detection covariates
 
-  // FIXME: do we need to drop dims?
-  vector<Type> psi_prob = invlogit(Xpsi * beta_psi);
-  vector<Type> p_prob_0 = invlogit(Xp * beta_p);
-  
-  vector
-  // likelihood
-  for (int i = 0; i < N; i++) { // loop over sites
-    if (obs[
-  }
+  vector<Type> eta_psi = Xpsi * beta_psi;
+  vector<Type> eta_p = Xp * beta_p;
 
-  for (int i = 0; i < nh; i++) {
-    vector<int> evennt = ch.row(i);
-    ALPHA = PROP * vector<Type>(B.row(e(i))); // element-wise vector product
-    REPORT(ALPHA);
-    for (int j = 1; j < N; j++) {
-      matrix<Type> TEMP = PHI.col(j-1);
-      matrix<Type> PHIj(2,2);
-      PHIj(0,0) = TEMP(0,0);
-      PHIj(0,1) = TEMP(1,0);
-      PHIj(1,0) = TEMP(2,0);
-      PHIj(1,1) = TEMP(3,0);
-      ALPHA = multvecmat(ALPHA,PHIj)* vector<Type>(B.row(evennt(j))); // vector matrix product, then element-wise vector product
+  Type s1, tmp_loglik, nll=0;
+
+  // likelihood (mostly stolen from glmmTMB.cpp)
+  for (int i = 0; i < N; i++) {
+    // dbinom_robust takes logit_prob rather than prob ...
+    tmp_loglik = dbinom_robust(obs(i), Type(1), eta_p(i), true);
+
+    Type logit_pz = eta_psi(site(i)) ;
+
+    // logspace_add computes log(exp(logx)+exp(logy))
+    // https://kaskr.github.io/adcomp/group__special__functions.html#ga2d5a07f1202dc628ba18ee9a2af8b9cd
+
+    Type log_pz   = -logspace_add( Type(0) , -logit_pz );
+    Type log_1mpz = -logspace_add( Type(0) ,  logit_pz );
+    
+    if (site_tot(site(i)) == Type(0)) {
+      //  equivalent: pz = invlogit(logit_pz);
+      //     log( pz(i) + (1.0 - pz(i)) * exp(tmp_loglik) );
+      tmp_loglik = logspace_add( log_pz, log_1mpz + tmp_loglik );
+    } else {
+      // equivalent: log( 1.0 - pz(i))
+      tmp_loglik += log_1mpz ;
     }
-    ll += log(sum(ALPHA));
+    nll -= tmp_loglik;
   }
-  nll = -ll;
   return nll;
 }
