@@ -20,22 +20,24 @@ Simulate some data (366 sites, 40 samples/site), model using TMB, ADMB, JAGS and
 library(tidyverse)
 library(unmarked)
 library(TMB)
+library(rbenchmark)
+library(broom.mixed)
 ```
 
 ```{r simulate, message=FALSE, warning=FALSE}
 R <- 366 # number of sites
 J <- 40  # samples per site
 beta_p <- c(-1,1) # fixed effect parameters for detection
-beta_psi <- c(-1,1) # fixed effect parameters for occupancy
+beta_phi <- c(-1,1) # fixed effect parameters for occupancy
 
 set.seed(101)
 dd <- expand.grid(site=factor(1:R), sample=factor(1:J))
 x_occ_0 <- rnorm(R)
-occ_prob <- plogis(model.matrix(~x_occ_0) %*% beta_psi)
+occ_prob <- plogis(model.matrix(~x_occ_0) %*% beta_phi)
 occ_val <- rbinom(R, size=1, prob=occ_prob)
 dd <- dd %>%
   mutate(x_p = rnorm(R*J),      ## detection covariate
-         x_psi = x_occ_0[site], ## occupancy covariate
+         x_phi = x_occ_0[site], ## occupancy covariate
          occ = occ_val[site],   ## map occupancy to samples
          det_prob = plogis(model.matrix(~x_p) %*% beta_p)*occ,
          obs =rbinom(R*J, size=1, prob=det_prob)
@@ -47,7 +49,7 @@ Back-calculate capture histories and site info for `unmarked::occu`:
 ```{r unmarked_extract}
 ## basic site-level info
 siteCovs_0 <- (dd
-  %>% select(site,x_psi)
+  %>% select(site,x_phi)
   %>% unique()
 )
 ## unmarked::occu() wants it "naked"; no tibbles
@@ -70,14 +72,18 @@ y <- (dd
 
 ```{r unmarked_run}
 uf <- unmarkedFrameOccu(y, siteCovs=siteCovs, obsCovs=obsCovs)
-occu( ~ x_p ~ x_psi, data=uf)
+occu( ~ x_p ~ x_phi, data=uf)
 ```
 
 For most of the other approaches it will be convenient to construct the model matrices ourselves in R, before them passing them to the relevant toolbox.
 
 ```{r make_model_matrices}
+dd <- arrange(dd,site) ## make sure we're in site-major order!
 site_tot <- dd %>% group_by(site) %>% summarise(x=sum(obs)) %>% pull(x)
-X_psi <- model.matrix(~ x_psi, data=siteCovs_0)
+## indices of beginning *and end* of samples per site
+site_ind <- c(0,which(diff(as.numeric(dd$site))>0),
+              length(dd$site))
+X_phi <- model.matrix(~ x_phi, data=siteCovs_0)
 X_p <- model.matrix(~ x_p, data=dd)
 ```
 
@@ -88,16 +94,32 @@ compile("simple_occupancy.cpp")
 dyn.load(dynlib("simple_occupancy"))
 f <- MakeADFun(
   data = c(as.list(dd[c("obs","site")]),
-           list(Xpsi = X_psi,
+           list(Xphi = X_phi,
                 Xp = X_p,
-                site_tot = site_tot)),
-  parameters = list(beta_psi = rep(0,ncol(X_psi)),
+                site_tot = site_tot,
+                site_ind = site_ind)),
+  parameters = list(beta_phi = rep(0,ncol(X_phi)),
                     beta_p = rep(0,ncol(X_p))),
-  DLL = "simple_occupancy")
-do.call("optim",f)
+  DLL = "simple_occupancy",
+  silent=TRUE)
+TMB_fit <- do.call("optim",f)
 ```
+
+```{r bench,cache=TRUE}
+(b1 <- benchmark(occu_C=occu( ~ x_p ~ x_phi, data=uf),
+                 occu_R=occu( ~ x_p ~ x_phi, data=uf, engine="R"),
+                 TMB=do.call("optim",f),
+                 replications=5,
+                 columns=c("test","elapsed","relative")))
+```
+
+FIXME: `microbenchmark` has nicer plots (but tabular output is ugly)
 
 ## brain dump
 
+- write out computational details of hierarchical binom model, especially the contortions needed to compute everything in log-space
 - formatting options for hierarchical input: capture-history matrix (convenient esp for balanced obs) vs. vector + site indicator (easier when everything is long format)? separate site-level model matrix etc. or combined (inefficient but maybe convenient) site + sample model matrix? Or a list? (The matrix/list minimize indexing to site level ... could provide an index vector ... In any case, need to maintain key distinction that occupancy is modeled at the site level ...)
 
+```{r SI}
+sessionInfo()
+```
