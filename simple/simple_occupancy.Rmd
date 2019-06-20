@@ -9,6 +9,10 @@ output:
 # To do
 
 - pull in .cpp/stan/jags from files, display/highlight
+- what the hell is Empirical Bayes doing?
+- get Stan code working here, try it in "optimize" mode
+- no real point trying JAGS ... NIMBLE??
+- write tidying methods
 
 # Overview
 
@@ -22,6 +26,8 @@ library(unmarked)
 library(TMB)
 library(rbenchmark)
 library(broom.mixed)
+library(Hmisc) ## llist
+library(rstan)
 ```
 
 ```{r simulate, message=FALSE, warning=FALSE}
@@ -35,13 +41,14 @@ dd <- expand.grid(site=factor(1:R), sample=factor(1:J))
 x_occ_0 <- rnorm(R)
 occ_prob <- plogis(model.matrix(~x_occ_0) %*% beta_phi)
 occ_val <- rbinom(R, size=1, prob=occ_prob)
-dd <- dd %>%
-  mutate(x_p = rnorm(R*J),      ## detection covariate
+dd <- (dd
+  %>% mutate(x_p = rnorm(R*J),  ## detection covariate
          x_phi = x_occ_0[site], ## occupancy covariate
          occ = occ_val[site],   ## map occupancy to samples
          det_prob = plogis(model.matrix(~x_p) %*% beta_p)*occ,
-         obs =rbinom(R*J, size=1, prob=det_prob)
+         obs = rbinom(R*J, size=1, prob=det_prob)
          )
+)
 ```
 
 Back-calculate capture histories and site info for `unmarked::occu`:
@@ -72,26 +79,39 @@ y <- (dd
 
 ```{r unmarked_run}
 uf <- unmarkedFrameOccu(y, siteCovs=siteCovs, obsCovs=obsCovs)
-occu( ~ x_p ~ x_phi, data=uf)
+(occu_fit <- occu( ~ x_p ~ x_phi, data=uf))
 ```
 
 For most of the other approaches it will be convenient to construct the model matrices ourselves in R, before them passing them to the relevant toolbox.
 
 ```{r make_model_matrices}
-dd <- arrange(dd,site) ## make sure we're in site-major order!
+dd <- ( dd
+  %>% arrange(site)      ## make sure we're in site-major order!
+  %>% mutate(n=seq(n())) ## add obs index
+)
 site_tot <- dd %>% group_by(site) %>% summarise(x=sum(obs)) %>% pull(x)
 ## indices of beginning *and end* of samples per site
 site_ind <- c(0,which(diff(as.numeric(dd$site))>0),
               length(dd$site))
 X_phi <- model.matrix(~ x_phi, data=siteCovs_0)
 X_p <- model.matrix(~ x_p, data=dd)
+## stuff for Stan model
+## FIXME: resolve phi/psi differences!
+n_site <- nrow(X_phi)
+m_psi <- ncol(X_phi)
+total_surveys <- nrow(X_p)
+m_p <- ncol(X_p)
+any_seen <- as.numeric(site_tot>0)
+n_survey <- count(dd,site) %>% pull(n) ## or table(dd$site)
+start_idx <- dd %>% group_by(site) %>% summarise(n=min(n)) %>% pull(n)
+end_idx   <- dd %>% group_by(site) %>% summarise(n=max(n)) %>% pull(n)
 ```
 
 ## TMB
 
 ```{r tmb_setup}
-compile("simple_occupancy.cpp")
-dyn.load(dynlib("simple_occupancy"))
+compile("SO_TMB.cpp")
+dyn.load(dynlib("SO_TMB"))
 f <- MakeADFun(
   data = c(as.list(dd[c("obs","site")]),
            list(Xphi = X_phi,
@@ -100,15 +120,39 @@ f <- MakeADFun(
                 site_ind = site_ind)),
   parameters = list(beta_phi = rep(0,ncol(X_phi)),
                     beta_p = rep(0,ncol(X_p))),
-  DLL = "simple_occupancy",
+  DLL = "SO_TMB",
   silent=TRUE)
 TMB_fit <- do.call("optim",f)
+class(f) <- "TMB"
+broom.mixed::tidy(f)
+```
+
+## Stan
+
+```{r stan_build}
+sm <- stan_model(file="SO_Stan.stan")
+```
+
+```{r stan_opt}
+stan_data <- llist(n_site, m_psi, X_psi=X_phi,
+                total_surveys, m_p, X_p,
+                site=as.integer(dd$site),
+                y=dd$obs,
+                start_idx, end_idx)
+##     data=stan_data)
+stan_opt <- optimizing(sm, data=stan_data)
+stan_opt$par[1:4]
+```
+
+```{r stan_sample, cache=TRUE}
+sampling(sm, data=stan_data)
 ```
 
 ```{r bench,cache=TRUE}
 (b1 <- benchmark(occu_C=occu( ~ x_p ~ x_phi, data=uf),
                  occu_R=occu( ~ x_p ~ x_phi, data=uf, engine="R"),
                  TMB=do.call("optim",f),
+                 stan_opt=optimizing(sm, data=stan_data),
                  replications=5,
                  columns=c("test","elapsed","relative")))
 ```
